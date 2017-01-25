@@ -1,0 +1,40 @@
+{
+  "db": {
+    "type": "mysql",
+    "config": {
+      "socketPath": "/var/lib/mysql/mysql.sock",
+      "user": "promaggr",
+      "password": "promaggr",
+      "database": "promaggr"
+    }
+  },
+  "upstream": {
+    "url": "http://127.0.0.1:9090/",
+    "start": 1460505600
+  },
+  "metric_defaults": {
+    "mode": "hourly_req",
+    "overTimes": [
+      "min",
+      "max",
+      "avg",
+      "stddev"
+    ],
+    "quantiles": [
+      0.05,
+      0.5,
+      0.95
+    ]
+  },
+  "metrics": [
+    {
+      "name": "total_clients",
+      "query": "total_clients[1h]"
+    },
+    {
+      "name": "meshnodes_online_total",
+      "query": "meshnodes_online_total[1h]"
+      "overTimes": ["min", "max", "avg"]
+    }
+  ]
+}

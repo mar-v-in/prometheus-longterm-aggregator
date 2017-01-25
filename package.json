@@ -1,0 +1,14 @@
+{
+  "name": "prometheus-longterm-aggregator",
+  "version": "0.0.1",
+  "main": "promaggr.js",
+  "dependencies": {
+    "mysql2": "^1.1.2",
+    "lodash": "^4.2.1",
+    "minimist": "^1.2.0"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "start": "node promaggr.js"
+  }
+}
