@@ -1,6 +1,6 @@
 /**
  * Database schema
- * metrics: id(int32),name(string),aggr(string)
+ * metrics: id(int32),name(string),aggr(string),end_of_fetch
  * data: metric(int32),timestamp(long/int64),value(double/float64)
  */
 
@@ -33,22 +33,52 @@ function logError(err) {
 
 // database code
 
+let connection_pool = null
 let connection = null
 if (_.get(config, "db.type") == "mysql") {
-    connection = mysql.createConnection(config.db.config)
-    connection.connect((err) => {
-        if (logError(err)) return
-    })
+    connection_pool = mysql.createPool(config.db.config);
+    //connection = mysql.createConnection(config.db.config)
+    //connection.connect((err) => logError(err))
 } else {
-    console.log("No database backend defined.")
+    console.log("!! No database backend defined.")
     process.exit()
 }
 
+function execute(sql, values, cb) {
+    if (connection_pool != null) {
+        connection_pool.execute(sql, values, cb)
+    }
+    if (connection != null) {
+        try {
+            connection.execute(sql, values, cb)
+        } catch (e) {
+            connection.connect((err) => {
+                cb(null, err)
+            })
+        }
+    }
+}
+
+function query(sql, values, cb) {
+    if (connection_pool != null) {
+        connection_pool.query(sql, values, cb)
+    }
+    if (connection != null) {
+        try {
+            connection.query(sql, values, cb)
+        } catch (e) {
+            connection.connect((err) => {
+                cb(null, err)
+            })
+        }
+    }
+}
+
 function metricIdForNamed(metricName, aggr, callback) {
-    connection.execute("SELECT id FROM metrics WHERE name LIKE ? AND aggr LIKE ?", [metricName, aggr], (err, res) => {
+    execute("SELECT id FROM metrics WHERE name LIKE ? AND aggr LIKE ?", [metricName, aggr], (err, res) => {
         if (logError(err)) return
         if (res && res[0] && res[0].id) return callback(res[0].id)
-        connection.query("INSERT INTO metrics (name, aggr) VALUES ( ? , ? ) ON DUPLICATE KEY UPDATE name=name", [metricName, aggr], (err, res) => {
+        execute("INSERT INTO metrics (name, aggr) VALUES ( ? , ? ) ON DUPLICATE KEY UPDATE name=name", [metricName, aggr], (err, res) => {
             if (logError(err)) return
             callback(res.insertId)
         })
@@ -56,7 +86,7 @@ function metricIdForNamed(metricName, aggr, callback) {
 }
 
 function maxStampForMetric(metricName, callback) {
-    connection.execute("SELECT MAX(timestamp) AS maxstamp, MIN(end_of_fetch) AS end_of_fetch FROM metrics LEFT JOIN data ON data.metric = metrics.id WHERE metrics.name = ?", [metricName], (err, res) => {
+    execute("SELECT MAX(timestamp) AS maxstamp, MIN(end_of_fetch) AS end_of_fetch FROM metrics LEFT JOIN data ON data.metric = metrics.id WHERE metrics.name = ?", [metricName], (err, res) => {
         if (logError(err)) return
         callback(Math.max(res[0].maxstamp, res[0].end_of_fetch))
     })
@@ -65,7 +95,7 @@ function maxStampForMetric(metricName, callback) {
 function getDataForPostProcessing(metricName, aggr, startStamp, endStamp, callback, errorCallback) {
     let query = "SELECT data.timestamp AS timestamp, data.value AS value FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND metrics.aggr = ? AND data.timestamp >= ? AND data.timestamp <= ? ORDER BY timestamp ASC"
     let queryArgs = [metricName, aggr, startStamp, endStamp]
-    connection.execute(query, queryArgs, (err, res) => {
+    execute(query, queryArgs, (err, res) => {
         if (logError(err)) return errorCallback()
         let results = [{metric: {__name__: aggr + "(" + metricName + ")"}, values: []}]
         res.forEach((row) => {
@@ -89,7 +119,7 @@ function getDataLargeRangeAndStep(metricName, aggr, range, startStamp, endStamp,
     if (valueSelect == null) return errorCallback()
     let query = "SELECT MAX(data.timestamp) AS timestamp, " + valueSelect + " AS value FROM (SELECT DISTINCT metrics.id AS id, CEIL(data.timestamp / ?) AS timestamp_step FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND data.timestamp >= ? AND data.timestamp <= ? AND metrics.aggr = ?) AS sub JOIN data ON data.metric = sub.id AND data.timestamp > (sub.timestamp_step * ?) - ? AND data.timestamp <= sub.timestamp_step * ? GROUP BY sub.timestamp_step ORDER BY timestamp"
     let queryArgs = [step, metricName, startStamp, endStamp, aggr, step, range, step]
-    connection.execute(query, queryArgs, (err, res) => {
+    execute(query, queryArgs, (err, res) => {
         if (logError(err)) return errorCallback()
         let results = [{metric: {__name__: aggr + "(" + metricName + "[" + range + "])"}, values: []}]
         res.forEach((row) => {
@@ -104,7 +134,7 @@ function getDataEqualRangeAndStep(metricName, aggr, rangeAndStep, startStamp, en
     if (valueSelect == null) return errorCallback()
     let query = "SELECT MAX(data.timestamp) AS timestamp, " + valueSelect + " AS value FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND metrics.aggr = ? AND data.timestamp >= ? AND data.timestamp <= ? GROUP BY (CEIL(data.timestamp/?)) ORDER BY timestamp ASC"
     let queryArgs = [metricName, aggr, startStamp, endStamp, rangeAndStep]
-    connection.execute(query, queryArgs, (err, res) => {
+    execute(query, queryArgs, (err, res) => {
         if (logError(err)) return errorCallback()
         let results = [{metric: {__name__: aggr + "(" + metricName + "[" + rangeAndStep + "])"}, values: []}]
         res.forEach((row) => {
@@ -128,9 +158,8 @@ function storeInDatabase(metricName, aggr, data, cont) {
                 maxKey = Math.max(maxKey, entry[0])
                 dbData.push([metric_id, entry[0], isNaN(parseFloat(entry[1])) ? null : parseFloat(entry[1])])
             })
-            connection.query("INSERT INTO data (metric, timestamp, value) VALUES ? ON DUPLICATE KEY UPDATE value=value", [dbData], (err, _) => {
+            query("INSERT INTO data (metric, timestamp, value) VALUES ? ON DUPLICATE KEY UPDATE value=value", [dbData], (err, _) => {
                 logError(err)
-                //console.log("Processed " + data.length + " values for " + metricName + "{aggr=" + aggr + "} in range " + new Date(minKey * 1000) + " - " + new Date(maxKey * 1000))
                 if (cont) cont()
             })
         })
@@ -139,7 +168,7 @@ function storeInDatabase(metricName, aggr, data, cont) {
 
 function storeEndOfFetch(metricName, aggr, val, cont) {
     metricIdForNamed(metricName, aggr, (metric_id) => {
-        connection.query("UPDATE metrics SET end_of_fetch=? WHERE id=?", [val, metric_id], (err, _) => {
+        query("UPDATE metrics SET end_of_fetch=? WHERE id=?", [val, metric_id], (err, _) => {
             logError(err)
             if (cont) cont()
         })
@@ -160,7 +189,7 @@ function queryPrometheusHourly(metric, startStamp, cont) {
     if (endStamp > (lastHour.getTime() / 1000)) endStamp = Math.floor(lastHour.getTime() / 1000)
 
     if (startStamp >= endStamp) {
-        console.log("[upstream] Metric is up-to-date")
+        console.log("Metric is up-to-date")
         return cont()
     }
 
@@ -184,21 +213,21 @@ function queryPrometheusHourly(metric, startStamp, cont) {
                         storeEndOfFetch(metric.name, aggr, endStamp, queryCont)
                     }
                 } catch (e) {
-                    console.log(e.message)
+                    console.log("!! " + e.message)
                 }
             })
         }
     }
 
     metric.overTimes.forEach((type) => {
-        let url = config.upstream.url + "api/v1/query_range?query=" + type + "_over_time(" + metric.query + ")&start=" + startStamp + "&end=" + endStamp + "&step=1h";
+        let url = config.upstream.url + "api/v1/query_range?query=" + type + "_over_time(" + metric.query + ")&start=" + startStamp + "&end=" + endStamp + "&step=1h"
         http.get(url, handleQueryData(type)).on('error', (err) => {
             logError(err)
             if (queryCont) queryCont()
         })
     })
     metric.quantiles.forEach((quant) => {
-        let url = config.upstream.url + "api/v1/query_range?query=quantile_over_time(" + quant + "," + metric.query + ")&start=" + startStamp + "&end=" + endStamp + "&step=1h";
+        let url = config.upstream.url + "api/v1/query_range?query=quantile_over_time(" + quant + "," + metric.query + ")&start=" + startStamp + "&end=" + endStamp + "&step=1h"
         http.get(url, handleQueryData("q" + quant)).on('error', (err) => {
             logError(err)
             if (queryCont) queryCont()
@@ -218,7 +247,7 @@ function queryPrometheusManually(metric, startStamp, cont) {
     if (endStamp >= (lastHour.getTime() / 1000)) endStamp = Math.floor(lastHour.getTime() / 1000) - 1
 
     if (startStamp >= endStamp) {
-        console.log("[upstream] Metric is up-to-date")
+        console.log("Metric is up-to-date")
         return cont()
     }
 
@@ -270,7 +299,7 @@ function queryPrometheusManually(metric, startStamp, cont) {
         })
     }
 
-    let url = config.upstream.url + "api/v1/query_range?query=" + metric.query + "&start=" + startStamp + "&end=" + endStamp + "&step=1m";
+    let url = config.upstream.url + "api/v1/query_range?query=" + metric.query + "&start=" + startStamp + "&end=" + endStamp + "&step=1m"
     http.get(url, handleQueryData).on('error', (err) => {
         logError(err)
         if (cont) cont()
@@ -284,7 +313,7 @@ function queryPrometheus(metric, startStamp, cont) {
     } else if (metric.mode == "manually_aggr") {
         queryPrometheusManually(metric, startStamp, cont)
     } else {
-        console.log("[upstream] Can't handle metric mode: " + metric.mode)
+        console.log("!! Can't handle metric mode: " + metric.mode)
         if (cont) cont()
     }
 }
@@ -304,10 +333,10 @@ function updateAll() {
     function updateCont(lastStamp) {
         if (lastStamp && lastStamp < Date.now() - 2592000) {
             if (++thisCount == limit) {
-                console.log("[upstream] Metric not done (is at " + new Date(lastStamp * 1000) + " now), but limit of " + limit + " reached. will continue later")
+                console.log("Metric not done (is at " + new Date(lastStamp * 1000) + " now), but limit of " + limit + " reached. will continue later")
                 thisCount = 0
             } else {
-                currentMetric--;
+                currentMetric--
             }
         } else {
             thisCount = 0
@@ -315,11 +344,11 @@ function updateAll() {
         if (config.metrics[currentMetric]) {
             let metric = _.merge(config.metric_defaults, config.metrics[currentMetric++])
             if (thisCount == 0) {
-                console.log("[upstream] About to update metric: " + metric.name)
+                console.log("About to update metric: " + metric.name)
             }
             updateUpsteam(metric, updateCont)
         }
-        else console.log("[upstream] Metric update done")
+        else console.log("Metric update done")
     }
 
     updateCont()
@@ -398,7 +427,7 @@ function parseMyQuery(query, step) {
 }
 
 function show500(stream, msg = "Internet server error") {
-    console.log("-> 500 " + msg)
+    console.log("ERR \"" + msg + "\" 500 - -")
     stream.writeHead(500, {'Content-Type': 'text/plain'})
     stream.write("500 " + msg)
     stream.end()
@@ -448,11 +477,11 @@ function aggregate(aggr, values) {
     return values[values.length - 1]
 }
 
-function handleQueryRange(stream, query, startStamp, endStamp, step) {
+function handleQueryRange(stream, raw_query, startStamp, endStamp, step) {
     let time_start = Date.now()
 
     step = parseIntervalToSeconds(step)
-    query = parseMyQuery(query, step)
+    let query = parseMyQuery(raw_query, step)
 
     function postProcess(result) {
         if (query.range > 3600) {
@@ -500,8 +529,7 @@ function handleQueryRange(stream, query, startStamp, endStamp, step) {
 
             let res = {status: "success", "data": {resultType: "matrix", result: result}}
 
-            console.log("[server:" + process.pid + "] query_range" + (debugName ? "[" + debugName + "]" : "") + ": metric: " + query.metric + " aggr: " + query.aggr + " start: " + new Date(startStamp * 1000).toLocaleString() + ", end: " + new Date(endStamp * 1000).toLocaleString() + ", step: " + step + ", range: " + query.range + ", process_time(db/proc): " + (time_after_db - time_start) + "/" + (Date.now() - time_after_db))
-
+            console.log("GET \"" + raw_query + "\" 200 " + JSON.stringify(res).length + " " + (Date.now() - time_start))
             stream.writeHead(200, {'Content-Type': 'application/json'})
             stream.write(JSON.stringify(res))
             stream.end()
@@ -517,7 +545,6 @@ function handleQueryRange(stream, query, startStamp, endStamp, step) {
 
             let res = {status: "success", "data": {resultType: "matrix", result: result}}
 
-            console.log("[server:" + process.pid + "] query_range" + (debugName ? "[" + debugName + "]" : "") + ": metric: " + query.metric + " aggr: " + query.aggr + " start: " + new Date(startStamp * 1000).toLocaleString() + ", end: " + new Date(endStamp * 1000).toLocaleString() + ", step: " + step + ", range: " + query.range + ", process_time(db/proc): " + (time_after_db - time_start) + "/" + (Date.now() - time_after_db))
             time_start = Date.now()
             getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "using post processing"), () => show500(stream))
         }
@@ -599,61 +626,40 @@ function handleNameLabelValues(stream) {
     return true
 }
 
-if (cluster.isMaster) {
-    let numWorkers = Math.max(4, require('os').cpus().length);
-
-    console.log('[cluster] Master cluster setting up ' + numWorkers + ' workers...');
-
-    for (let i = 0; i < numWorkers; i++) {
-        cluster.fork();
-    }
-
-    cluster.on('online', function (worker) {
-        console.log('[cluster] Worker ' + worker.process.pid + ' is online');
-    });
-
-    cluster.on('exit', function (worker, code, signal) {
-        console.log('[cluster] Worker ' + worker.process.pid + ' died with code: ' + code + ', and signal: ' + signal);
-        console.log('[cluster] Starting a new worker');
-        cluster.fork();
-    });
-
-    startUpstreamQuerying()
-} else {
-    http.createServer((req, stream) => {
-        if (req.method != "GET") return show500(stream)
-        try {
-            let path = url.parse(req.url).pathname
-            let params = url.parse(req.url, true).query
-            switch (path) {
-                case "/api/v1/query_range":
-                    if (!params.query) return show500(stream, "query is required")
-                    let query = params.query
-                    let start = parseInt(params.start) || Math.floor(Date.now() / 1000 - 3600)
-                    let end = parseInt(params.end) || Math.floor(Date.now() / 1000)
-                    let step = params.step || "1h"
-                    if (handleQueryRange(stream, query, start, end, step)) return
-                    return show500(stream, "Request not handled")
-                case "/api/v1/series":
-                    let match = params["match[]"]
-                    if (!match) return show500(stream, "match[] is required")
-                    if (!Array.isArray(match)) match = [match]
-                    if (handleSeries(stream, match)) return
-                    return show500(stream, "Request not handled")
-                /*            case "/api/v1/label/aggr/values":
-                 if (handleAggrLabelValues(stream)) return
-                 return show500(stream, "Request not handled")*/
-                case "/api/v1/label/__name__/values":
-                    if (handleNameLabelValues(stream)) return
-                    return show500(stream, "Request not handled")
-                default:
-                    return show500(stream, "Unknown request")
-            }
-        } catch (e) {
-            show500(stream, "Internal server error: " + e.stack)
+http.createServer((req, stream) => {
+    if (req.method != "GET") return show500(stream)
+    try {
+        let path = url.parse(req.url).pathname
+        let params = url.parse(req.url, true).query
+        switch (path) {
+            case "/api/v1/query_range":
+                if (!params.query) return show500(stream, "query is required")
+                let query = params.query
+                let start = parseInt(params.start) || Math.floor(Date.now() / 1000 - 3600)
+                let end = parseInt(params.end) || Math.floor(Date.now() / 1000)
+                let step = params.step || "1h"
+                if (handleQueryRange(stream, query, start, end, step)) return
+                return show500(stream, "Request not handled")
+            case "/api/v1/series":
+                let match = params["match[]"]
+                if (!match) return show500(stream, "match[] is required")
+                if (!Array.isArray(match)) match = [match]
+                if (handleSeries(stream, match)) return
+                return show500(stream, "Request not handled")
+            /*            case "/api/v1/label/aggr/values":
+             if (handleAggrLabelValues(stream)) return
+             return show500(stream, "Request not handled")*/
+            case "/api/v1/label/__name__/values":
+                if (handleNameLabelValues(stream)) return
+                return show500(stream, "Request not handled")
+            default:
+                return show500(stream, "Unknown request")
         }
-    }).listen(9123, '127.0.0.1', () => {
-        console.log("[server:" + process.pid + "] Started prometheus-like interface on 127.0.0.1:9123")
-    })
-}
+    } catch (e) {
+        show500(stream, "Internal server error: " + e.stack)
+    }
+}).listen(9123, '127.0.0.1', () => {
+    console.log("Started prometheus-like interface on 127.0.0.1:9123")
+})
 
+startUpstreamQuerying()
