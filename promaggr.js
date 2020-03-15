@@ -109,7 +109,7 @@ function valueSelectFromAggr(aggr) {
     if (aggr == "avg" || aggr == "min" || aggr == "max") return aggr + "(data.value)"
     if (aggr.indexOf("q") === 0) {
         let q = parseFloat(aggr.substr(1, aggr.length))
-        return "percentile_disc(data.value, " + q + ")"
+        return "percentile_disc_compat(data.value, " + q + ")"
     }
     return null
 }
