@@ -12,6 +12,7 @@ const mysql = require('mysql2')
 const http = require('http')
 const url = require('url')
 const cluster = require('cluster')
+const querystring = require('querystring')
 
 // load configuration
 
@@ -96,7 +97,7 @@ function getDataForPostProcessing(metricName, aggr, startStamp, endStamp, callba
     let query = "SELECT data.timestamp AS timestamp, data.value AS value FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND metrics.aggr = ? AND data.timestamp >= ? AND data.timestamp <= ? ORDER BY timestamp ASC"
     let queryArgs = [metricName, aggr, startStamp, endStamp]
     execute(query, queryArgs, (err, res) => {
-        if (logError(err)) return errorCallback()
+        if (logError(err)) return errorCallback(err.message)
         let results = [{metric: {__name__: aggr + "(" + metricName + ")"}, values: []}]
         res.forEach((row) => {
             results[0].values.push([row.timestamp, row.value + ""])
@@ -116,11 +117,11 @@ function valueSelectFromAggr(aggr) {
 
 function getDataLargeRangeAndStep(metricName, aggr, range, startStamp, endStamp, step, callback, errorCallback) {
     let valueSelect = valueSelectFromAggr(aggr)
-    if (valueSelect == null) return errorCallback()
+    if (valueSelect == null) return errorCallback("No value select")
     let query = "SELECT MAX(data.timestamp) AS timestamp, " + valueSelect + " AS value FROM (SELECT DISTINCT metrics.id AS id, CEIL(data.timestamp / ?) AS timestamp_step FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND data.timestamp >= ? AND data.timestamp <= ? AND metrics.aggr = ?) AS sub JOIN data ON data.metric = sub.id AND data.timestamp > (sub.timestamp_step * ?) - ? AND data.timestamp <= sub.timestamp_step * ? GROUP BY sub.timestamp_step ORDER BY timestamp"
     let queryArgs = [step, metricName, startStamp, endStamp, aggr, step, range, step]
     execute(query, queryArgs, (err, res) => {
-        if (logError(err)) return errorCallback()
+        if (logError(err)) return errorCallback(err.message)
         let results = [{metric: {__name__: aggr + "(" + metricName + "[" + range + "])"}, values: []}]
         res.forEach((row) => {
             results[0].values.push([row.timestamp, row.value + ""])
@@ -131,11 +132,11 @@ function getDataLargeRangeAndStep(metricName, aggr, range, startStamp, endStamp,
 
 function getDataEqualRangeAndStep(metricName, aggr, rangeAndStep, startStamp, endStamp, callback, errorCallback) {
     let valueSelect = valueSelectFromAggr(aggr)
-    if (valueSelect == null) return errorCallback()
+    if (valueSelect == null) return errorCallback("No value select")
     let query = "SELECT MAX(data.timestamp) AS timestamp, " + valueSelect + " AS value FROM metrics JOIN data ON data.metric = metrics.id WHERE metrics.name = ? AND metrics.aggr = ? AND data.timestamp >= ? AND data.timestamp <= ? GROUP BY (CEIL(data.timestamp/?)) ORDER BY timestamp ASC"
     let queryArgs = [metricName, aggr, startStamp, endStamp, rangeAndStep]
     execute(query, queryArgs, (err, res) => {
-        if (logError(err)) return errorCallback()
+        if (logError(err)) return errorCallback(err.message)
         let results = [{metric: {__name__: aggr + "(" + metricName + "[" + rangeAndStep + "])"}, values: []}]
         res.forEach((row) => {
             results[0].values.push([row.timestamp, row.value + ""])
@@ -426,7 +427,7 @@ function parseMyQuery(query, step) {
     return res
 }
 
-function show500(stream, msg = "Internet server error") {
+function show500(stream, msg = "Internal server error") {
     console.log("ERR \"" + msg + "\" 500 - -")
     stream.writeHead(500, {'Content-Type': 'text/plain'})
     stream.write("500 " + msg)
@@ -546,7 +547,7 @@ function handleQueryRange(stream, raw_query, startStamp, endStamp, step) {
             let res = {status: "success", "data": {resultType: "matrix", result: result}}
 
             time_start = Date.now()
-            getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "using post processing"), () => show500(stream))
+            getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "using post processing"), (msg) => show500(stream, msg))
         }
     }
 
@@ -562,20 +563,20 @@ function handleQueryRange(stream, raw_query, startStamp, endStamp, step) {
 
         if (step == query.range) {
             // puts the effort of range/step into the database by using a group statement, very efficient, but required range == step
-            getDataEqualRangeAndStep(query.metric, query.aggr, query.range, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(false, "equal range SQL"), () => show500(stream))
+            getDataEqualRangeAndStep(query.metric, query.aggr, query.range, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(false, "equal range SQL"), (msg) => show500(stream, msg))
         } else if (euclid(step, query.range) > 3600 && Math.max(step, query.range) < euclid(step, query.range) * 168) {
             // let the db merge some data and do other by postprocessing
-            getDataEqualRangeAndStep(query.metric, query.aggr, euclid(step, query.range), startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "combined SQL+pp"), () => show500(stream))
+            getDataEqualRangeAndStep(query.metric, query.aggr, euclid(step, query.range), startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "combined SQL+pp"), (msg) => show500(stream, msg))
         } else if (step >= 86400 && query.range >= 604800) {
             // puts the effort of range/step into the database by using a subquery, only more efficient when using large range (like trend lines)
-            getDataLargeRangeAndStep(query.metric, query.aggr, query.range, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), step, dataCallback(false, "large range SQL"), () => show500(stream))
+            getDataLargeRangeAndStep(query.metric, query.aggr, query.range, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), step, dataCallback(false, "large range SQL"), (msg) => show500(stream, msg))
         } else {
             // fallback to post processing only, it works everytime
-            getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "fallback pp"), () => show500(stream))
+            getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "fallback pp"), (msg) => show500(stream, msg))
         }
     } else {
         // get all required data and do range/step in js, not as inefficient as it sounds ;)
-        getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "default pp"), () => show500(stream))
+        getDataForPostProcessing(query.metric, query.aggr, startStamp - Math.max(step, query.range), endStamp + Math.max(step, query.range), dataCallback(true, "default pp"), (msg) => show500(stream, msg))
     }
     return true
 }
@@ -626,11 +627,21 @@ function handleNameLabelValues(stream) {
     return true
 }
 
-http.createServer((req, stream) => {
-    if (req.method != "GET") return show500(stream)
+async function extractParams(req) {
+    if (req.method == "GET") return url.parse(req.url, true).query
+    let rawData = ''
+    req.on('data', chunk => { rawData += chunk })
+    return await new Promise((cont, err) => {
+        req.on('end', () => cont(querystring.decode(rawData)))
+        req.on('error', err)
+    })
+}
+
+http.createServer(async (req, stream) => {
+    if (req.method != "GET" && req.method != "POST") return show500(stream, req.method + " not allowed")
     try {
         let path = url.parse(req.url).pathname
-        let params = url.parse(req.url, true).query
+        let params = await extractParams(req)
         switch (path) {
             case "/api/v1/query_range":
                 if (!params.query) return show500(stream, "query is required")
